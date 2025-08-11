@@ -287,7 +287,8 @@ Choose actions that maximally reduce entropy of promotion decisions or causal ta
 
 ## 6) Module Interfaces
 
-* **aethermind-interpretation** → emits Event Records (+ embeddings, annotations, `self_action_score`).
+* **aethermind-perception** → captures synchronized raw inputs; produces **EventSeed** records (IDs, timing, raw paths, lightweight dyn features) and publishes them to the bus.
+* **aethermind-interpretation** → subscribes to EventSeed, runs annotators (vision/audio/speech/motion), computes T/S/F embeddings, and **upgrades EventSeed → EventRecord** (non-destructively). Also computes `self_action_score` using input semantics.
 * **learning.forward\_model** → produces expectations & counterfactuals.
 * **learning.clustering** → maintains U/C spaces + symbol graph.
 * **learning.causality** → updates causal beliefs; exposes `predict_effect(context, action)`.
@@ -295,7 +296,68 @@ Choose actions that maximally reduce entropy of promotion decisions or causal ta
 * **reflection** → summarizes learned symbols/links; surfaces open questions.
 * **planner** → selects experiments using intrinsic reward.
 
----
+### 6.1 Perception ↔ Interpretation Contract (Proposed)
+
+**EventSeed (perception output)**
+
+```json
+{
+  "event_uid": "session_...|chunk_0000.mp4|1754093547.000-1754093549.000",
+  "session_id": "session_20250805_162657",
+  "start": 1754093547.0,
+  "end": 1754093549.0,
+  "source": "perception",
+  "video_path": "chunks/.../chunk_0000.mp4",
+  "audio_path": "chunks/.../chunk_0000.wav",
+  "actions": [ { "ts": 1754093547.7141, "raw": {...}, "semantic": {"action": null, "valid_for_game": false} } ],
+  "sync": { "av_ms": 2.1, "ai_ms": -3.4, "vi_ms": 1.0, "beacon_id": 42 },
+  "video_dyn": { "flow_mean": 0.013, "flow_std": 0.004, "cut_prob": 0.02 },
+  "audio_dyn": { "rms_frames": [0.011, 0.013, ...], "sr": 16000 },
+  "system": { "fps": 60, "dropped_frames": 0, "window_focused": true },
+  "decision_trace": { "id": null, "policy_hash": null },
+  "valence": { "label": "unknown", "moral": 0.0, "risk": 0.0, "reward_proxy": 0.0 }
+}
+```
+
+**EventRecord (interpretation output)**
+
+* Exactly your rich schema from §2.1, plus computed fields:
+
+  * `annotations.*` (vision\_tags, audio\_moods, scene\_type, speech\_transcript, motion\_analysis, vector\_summary, vector\_spikes)
+  * `embeddings.T/S/F`
+  * `agency.self_action_score`, `motor_function`, `decision_trace_id`
+  * optional `expectation`, `observation`, `prediction_error`, `causality` when available.
+
+**Idempotency rule**: Interpretation **must not** overwrite Perception’s raw fields; it only appends or fills `null` targets. If re-run, it should detect an existing `event_id` and write a **new version** `event_id_v2` with a pointer `prev_event_id`.
+
+### 6.2 Transport & Storage
+
+* **Message bus (recommended)**: `events.seed` → `events.enriched` topics.
+* **Dedup key**: `event_uid`.
+* **Backpressure**: interpretation workers ack with `processing_ms`; Perception throttles when queue depth > N.
+* **Memory layout**:
+
+  * `/sessions/{session_id}/raw/{video,audio}/...`
+  * `/sessions/{session_id}/events/{event_id}.json` (EventRecord)
+  * `/sessions/{session_id}/events/{event_id}/embeddings/{T,S,F}.npy`
+
+### 6.3 Validation & Versioning
+
+* JSONSchema for EventSeed and EventRecord with semantic checks (e.g., `0 ≤ self_action_score ≤ 1`).
+* Add `schema_version`: `{major: 1, minor: 0}` to both.
+* Write **change logs** to `events/{event_id}/audit.json` capturing annotator versions and hashes.
+
+### 6.4 Failure Modes & Recovery
+
+* If annotator fails: emit `events.error` with `{event_uid, annotator, error, retryable}`; keep EventSeed intact.
+* Partial success allowed: attach `annotations.partial=true` and a list of completed annotators.
+* Reprocessing job can resubscribe to past EventSeeds using a time/window filter.
+
+### 6.5 Metrics (Perception responsibility)
+
+* `capture.fps`, `capture.dropped_frames`, `sync.lag_ms{av,ai,vi}` (p50/p95),
+* `inputs.valid_for_game_ratio`, `inputs.semantic_coverage` (mapped vs raw),
+* `events.throughput` (seed/sec), `bus.backlog`.
 
 ## 7) Sequence Diagrams
 

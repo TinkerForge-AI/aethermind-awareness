@@ -1,4 +1,7 @@
 """
+python3 -m learning.symbols cluster --session-id session_20250808_220541
+(run on 8/1/25)
+
 Quick usage:
 
 # Cluster everything (assign threshold 0.78 is a good start)
@@ -57,6 +60,7 @@ def _ensure_tables(con) -> None:
         symbol_id  TEXT,
         event_id   TEXT,
         event_uid  TEXT,
+        episode_id TEXT,
         start_ts   DOUBLE,
         end_ts     DOUBLE,
         F          BLOB,                 -- float32[]
@@ -73,11 +77,14 @@ def _ensure_tables(con) -> None:
     """)
 
 # -------------------- helpers --------------------
-def _b2f(buf: Optional[bytes]) -> Optional[np.ndarray]:
-    if buf is None or not isinstance(buf, (bytes, bytearray)):
-        return None  # Return None if the input is not a valid bytes-like object
-    arr = np.frombuffer(buf, dtype=np.float32)
-    return arr.copy()
+def _b2f(buf: Optional[Any]) -> Optional[np.ndarray]:
+    if buf is None:
+        return None
+    if isinstance(buf, list):  # Handle DuckDB double[] directly
+        return np.array(buf, dtype=np.float32)
+    if isinstance(buf, (bytes, bytearray)):  # Handle BLOBs
+        return np.frombuffer(buf, dtype=np.float32).copy()
+    return None  # Return None for unsupported types
 
 def _f2b(arr: Optional[np.ndarray]) -> Optional[bytes]:
     if arr is None: return None
@@ -102,10 +109,7 @@ def fetch_events_for_clustering(
     session_id: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Pull events that have embeddings_F.
-    Columns expected in events: event_id, event_uid, start_ts, end_ts, embeddings_F BLOB
-    """
+    print(f"[debug] Fetching events for clustering (session_id={session_id}, limit={limit})")
     con = get_con()
     _ensure_tables(con)
 
@@ -124,7 +128,10 @@ def fetch_events_for_clustering(
     if limit:
         sql += f" LIMIT {int(limit)}"
 
+    print(f"[debug] Executing SQL: {sql}")
     rows = con.execute(sql, args).fetchall()
+    print(f"[debug] Retrieved {len(rows)} rows")
+
     out: List[Dict[str, Any]] = []
     for r in rows:
         embeddings_F = _b2f(r[3]) if len(r) > 3 else None  # Ensure index is valid
@@ -135,14 +142,18 @@ def fetch_events_for_clustering(
             "end_ts": float(r[2]) if r[2] is not None else None,
             "F": embeddings_F,
         })
+    print(f"[debug] Processed {len(out)} events for clustering")
     return out
 
 def load_symbols() -> List[Dict[str, Any]]:
+    print("[debug] Loading symbols from database")
     con = get_con()
     rows = con.execute("""
         SELECT symbol_id, status, size_events, centroid, tags_json, note
         FROM symbols
     """).fetchall()
+    print(f"[debug] Retrieved {len(rows)} symbols")
+
     syms: List[Dict[str, Any]] = []
     for r in rows:
         syms.append({
@@ -153,10 +164,12 @@ def load_symbols() -> List[Dict[str, Any]]:
             "tags": json.loads(r[4]) if r[4] else [],
             "note": r[5],
         })
+    print(f"[debug] Loaded {len(syms)} symbols")
     return syms
 
 def upsert_symbol(symbol_id: str, centroid: np.ndarray, size: int,
                   status: str = "uncategorized", tags: Optional[List[str]] = None, note: Optional[str] = None) -> None:
+    print(f"[debug] Upserting symbol {symbol_id} (size={size}, status={status})")
     con = get_con()
     con.execute("""
         INSERT OR REPLACE INTO symbols
@@ -165,12 +178,22 @@ def upsert_symbol(symbol_id: str, centroid: np.ndarray, size: int,
     """, [symbol_id, status, int(size), _f2b(centroid), json.dumps(tags or []), note])
 
 def add_member(symbol_id: str, ev: Dict[str, Any]) -> None:
+    print(f"[debug] Adding event {ev['event_id']} to symbol {symbol_id}")
     con = get_con()
+    # Try to fetch episode_id for this event
+    episode_id = None
+    try:
+        row = con.execute("SELECT episode_id FROM events WHERE event_id = ?", [ev["event_id"]]).fetchone()
+        if row:
+            episode_id = row[0]
+    except Exception as e:
+        print(f"[warn] Could not fetch episode_id for event {ev['event_id']}: {e}")
     con.execute("""
         INSERT OR REPLACE INTO symbol_members
-          (symbol_id, event_id, event_uid, start_ts, end_ts, F)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, [symbol_id, ev["event_id"], ev.get("event_uid"), ev.get("start_ts"), ev.get("end_ts"), _f2b(ev["F"])])
+          (symbol_id, event_id, event_uid, episode_id, start_ts, end_ts, F)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, [symbol_id, ev["event_id"], ev.get("event_uid"), episode_id, ev.get("start_ts"), ev.get("end_ts"), _f2b(ev["F"])]
+    )
 
 # -------------------- clustering core --------------------
 def _assign_or_create(
@@ -213,11 +236,7 @@ def stream_cluster(
     dry_run: bool = False,
     verbose: bool = True,
 ) -> None:
-    """
-    Online assign-or-create clustering with cosine similarity.
-    - tau_assign: minimum cosine similarity to join an existing symbol; else create new.
-    - normalize: L2-normalize vectors before sim/updates (recommended).
-    """
+    print(f"[debug] Starting stream_cluster (tau_assign={tau_assign}, limit_events={limit_events}, session_id={session_id})")
     con = get_con()
     _ensure_tables(con)
 
@@ -227,7 +246,7 @@ def stream_cluster(
     # Stream events
     events = fetch_events_for_clustering(session_id=session_id, limit=limit_events)
     if verbose:
-        print(f"[cluster] Loaded {len(symbols)} existing symbols, {len(events)} events.")
+        print(f"[debug] Loaded {len(symbols)} existing symbols, {len(events)} events.")
 
     created = 0
     joined  = 0
@@ -235,6 +254,7 @@ def stream_cluster(
     for ev in events:
         v = ev["F"]
         if v is None:  # skip if no vector
+            print(f"[debug] Skipping event {ev['event_id']} (no vector)")
             continue
         if normalize:
             v = _normalize(v)
@@ -370,6 +390,29 @@ def main():
             dry_run=args.dry_run,
             verbose=not args.quiet,
         )
+        # Automated HITL report: episode-to-symbol mapping
+        con = get_con()
+        print("\n[HITL] Episode-to-Symbol Mapping Report:")
+        rows = con.execute('''
+            SELECT sm.event_id, sm.symbol_id, s.status, s.tags_json, s.note
+            FROM symbol_members sm
+            LEFT JOIN symbols s ON sm.symbol_id = s.symbol_id
+            ORDER BY sm.event_id ASC;
+        ''').fetchall()
+        report_lines = []
+        for r in rows:
+            event_id, symbol_id, status, tags_json, note = r
+            line = f"  Event {event_id} → Symbol {symbol_id} | Status: {status} | Tags: {tags_json or '[]'} | Note: {note or ''}"
+            print(line)
+            report_lines.append(line)
+        print("[HITL] End of mapping report.\n")
+        # Write report to log file in learning/
+        log_path = os.path.join(os.path.dirname(__file__), "learning_report.log")
+        with open(log_path, "w") as f:
+            f.write("[HITL] Episode-to-Symbol Mapping Report:\n")
+            for line in report_lines:
+                f.write(line + "\n")
+            f.write("[HITL] End of mapping report.\n")
     elif args.cmd == "stats":
         show_stats(top_k=args.top_k)
     elif args.cmd == "list":
